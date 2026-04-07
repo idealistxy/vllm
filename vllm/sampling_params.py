@@ -208,6 +208,13 @@ class SamplingParams(
     guided_decoding: Optional[GuidedDecodingParams] = None
     logit_bias: Optional[Dict[int, float]] = None
     allowed_token_ids: Optional[List[int]] = None
+    # Optional native multi-head sampling payload.
+    # Example:
+    # {
+    #   "stoken": {"do_sample": True, "temperature": 0.7, "top_k": 0, "top_p": 1.0},
+    #   "control": {"do_sample": False, "temperature": 1.0, "top_k": 0, "top_p": 1.0}
+    # }
+    multihead_sampling: Optional[Dict[str, Any]] = None
 
     @staticmethod
     def from_optional(
@@ -240,6 +247,7 @@ class SamplingParams(
         guided_decoding: Optional[GuidedDecodingParams] = None,
         logit_bias: Optional[Union[Dict[int, float], Dict[str, float]]] = None,
         allowed_token_ids: Optional[List[int]] = None,
+        multihead_sampling: Optional[Dict[str, Any]] = None,
     ) -> "SamplingParams":
         if logit_bias is not None:
             logit_bias = {
@@ -279,6 +287,7 @@ class SamplingParams(
             guided_decoding=guided_decoding,
             logit_bias=logit_bias,
             allowed_token_ids=allowed_token_ids,
+            multihead_sampling=multihead_sampling,
         )
 
     def __post_init__(self) -> None:

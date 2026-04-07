@@ -850,6 +850,14 @@ def _pythonize_sampler_output(
         seq_ids = seq_group.seq_ids
         next_token_ids = sample_result
         parent_ids = [0]
+        group_stoken_token_ids = None
+        if (output.stoken_token_ids is not None
+                and sgdx < len(output.stoken_token_ids)):
+            group_stoken_token_ids = output.stoken_token_ids[sgdx]
+        group_control_token_ids = None
+        if (output.control_token_ids is not None
+                and sgdx < len(output.control_token_ids)):
+            group_control_token_ids = output.control_token_ids[sgdx]
 
         if cache is not None:
             completion_seq_group_output: CompletionSequenceGroupOutput = \
@@ -895,11 +903,17 @@ def _pythonize_sampler_output(
         if cache is not None:
             completion_seq_group_output.prompt_logprobs = \
                 group_prompt_logprobs if any_logprobs_are_requested else None
+            completion_seq_group_output.stoken_token_ids = \
+                group_stoken_token_ids
+            completion_seq_group_output.control_token_ids = \
+                group_control_token_ids
             output.outputs.append(completion_seq_group_output)
         else:
             output.outputs.append(
                 CompletionSequenceGroupOutput(
                     seq_outputs, (group_prompt_logprobs
-                                  if any_logprobs_are_requested else None)))
+                                  if any_logprobs_are_requested else None),
+                    group_stoken_token_ids,
+                    group_control_token_ids))
 
     assert len(output.outputs) > 0

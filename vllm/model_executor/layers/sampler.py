@@ -4,7 +4,7 @@ import warnings
 from dataclasses import dataclass
 from importlib.util import find_spec
 from math import inf
-from typing import Dict, Iterator, List, Optional, Tuple, Union
+from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 import msgspec
 import torch
@@ -29,6 +29,9 @@ if envs.VLLM_USE_FLASHINFER_SAMPLER and find_spec("flashinfer"):
     # yapf: enable
 else:
     flashinfer_top_k_top_p_sampling = None
+
+# Numerical epsilon used by sampling parameter checks.
+_SAMPLING_EPS = 1e-5
 
 
 def get_sampler() -> torch.nn.Module:
@@ -104,6 +107,9 @@ class SamplerOutput(
 
     # On-device tensor containing the sampled token ids.
     sampled_token_ids: Optional[torch.Tensor] = None
+    # Optional side-branch sampled token ids, indexed by sequence-group index.
+    stoken_token_ids: Optional[List[Optional[List[int]]]] = None
+    control_token_ids: Optional[List[Optional[List[int]]]] = None
     # CPU tensor containing the sampled token ids. Used during multi-step to
     # return the sampled token ids from last rank to AsyncLLMEngine to be
     # 'broadcasted' to all other PP ranks for next step.
@@ -267,6 +273,11 @@ class Sampler(nn.Module):
         # Use float32 to apply temperature scaling.
         # Use in-place division to avoid creating a new tensor.
         logits = logits.to(torch.float)
+        multihead_logits_base = None
+        if _has_multihead_sampling(sampling_metadata):
+            # Keep an unscaled copy so stoken/control can use independent
+            # temperature/top-k/top-p settings.
+            multihead_logits_base = logits.clone()
         logits.div_(sampling_tensors.temperatures.unsqueeze(dim=1))
 
         if do_top_p_top_k and flashinfer_top_k_top_p_sampling is None:
@@ -313,11 +324,19 @@ class Sampler(nn.Module):
             prompt_logprobs, sample_logprobs = get_logprobs(
                 logprobs, sampling_metadata, maybe_deferred_sample_results)
 
+        (stoken_token_ids,
+         control_token_ids) = _sample_multihead_token_ids(
+             logits=multihead_logits_base,
+             sampling_metadata=sampling_metadata,
+             maybe_deferred_sample_results=maybe_deferred_sample_results)
+
         return _build_sampler_output(
             maybe_deferred_sample_results,
             sampling_metadata,
             prompt_logprobs,
             sample_logprobs,
+            stoken_token_ids=stoken_token_ids,
+            control_token_ids=control_token_ids,
             on_device_tensors=on_device_tensors,
             skip_sampler_cpu_output=sampling_metadata.skip_sampler_cpu_output)
 
@@ -1235,11 +1254,198 @@ def _modify_greedy_probs_inplace(logprobs: torch.Tensor, probs: torch.Tensor,
     probs[sample_indices, greedy_samples] = 1.0
 
 
+def _has_multihead_sampling(sampling_metadata: SamplingMetadata) -> bool:
+    for seq_group in sampling_metadata.seq_groups:
+        payload = seq_group.sampling_params.multihead_sampling
+        if not isinstance(payload, dict):
+            continue
+        if isinstance(payload.get("stoken"), dict) or isinstance(
+                payload.get("control"), dict):
+            return True
+    return False
+
+
+def _normalize_branch_sampling_config(
+    config: Any,
+    vocab_size: int,
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(config, dict):
+        return None
+
+    do_sample = bool(config.get("do_sample", True))
+    temperature = float(config.get("temperature", 1.0))
+    top_p = float(config.get("top_p", 1.0))
+    min_p = float(config.get("min_p", 0.0))
+
+    try:
+        top_k = int(config.get("top_k", -1))
+    except (TypeError, ValueError):
+        top_k = -1
+    if top_k <= 0:
+        top_k = vocab_size
+    top_k = min(top_k, vocab_size)
+
+    top_p = max(0.0, min(1.0, top_p))
+    min_p = max(0.0, min(1.0, min_p))
+
+    if temperature < _SAMPLING_EPS:
+        # Keep deterministic behavior explicit and avoid division by zero.
+        do_sample = False
+        temperature = 1.0
+
+    return {
+        "do_sample": do_sample,
+        "temperature": temperature,
+        "top_p": top_p,
+        "top_k": top_k,
+        "min_p": min_p,
+    }
+
+
+def _clone_generator(
+    generator: Optional[torch.Generator],
+    target_device: torch.device,
+) -> Optional[torch.Generator]:
+    if generator is None:
+        return None
+
+    generator_device = target_device
+    if hasattr(generator, "device"):
+        generator_device = torch.device(generator.device)
+
+    cloned = torch.Generator(device=generator_device)
+    cloned.set_state(generator.get_state())
+    return cloned
+
+
+def _sample_side_branch_token(
+    logits_row: torch.Tensor,
+    branch_config: Dict[str, Any],
+    generator: Optional[torch.Generator],
+) -> int:
+    logits = logits_row.unsqueeze(0).clone()
+
+    temperature = float(branch_config["temperature"])
+    if temperature != 1.0:
+        logits.div_(temperature)
+
+    top_k = int(branch_config["top_k"])
+    top_p = float(branch_config["top_p"])
+    if top_k < logits.shape[-1] or top_p < 1.0 - _SAMPLING_EPS:
+        logits = _apply_top_k_top_p(
+            logits,
+            logits.new_tensor([top_p]),
+            torch.tensor([top_k], dtype=torch.long, device=logits.device),
+        )
+
+    min_p = float(branch_config["min_p"])
+    if min_p > _SAMPLING_EPS:
+        logits = _apply_min_p(logits, logits.new_tensor([min_p]))
+
+    if not bool(branch_config["do_sample"]):
+        return int(torch.argmax(logits, dim=-1).item())
+
+    probs = torch.softmax(logits, dim=-1, dtype=torch.float)
+    sampled_token = torch.multinomial(probs[0],
+                                      num_samples=1,
+                                      generator=generator)
+    return int(sampled_token.item())
+
+
+def _sample_multihead_token_ids(
+    logits: Optional[torch.Tensor],
+    sampling_metadata: SamplingMetadata,
+    maybe_deferred_sample_results: MaybeDeferredSampleResultType,
+) -> Tuple[Optional[List[Optional[List[int]]]], Optional[List[Optional[List[
+        int]]]]]:
+    if logits is None:
+        return (None, None)
+
+    sample_results: Optional[SampleResultType]
+    if isinstance(maybe_deferred_sample_results, SampleResultArgsType):
+        sample_results = None
+    else:
+        sample_results = maybe_deferred_sample_results
+
+    stoken_token_ids: List[Optional[List[int]]] = [
+        None for _ in sampling_metadata.seq_groups
+    ]
+    control_token_ids: List[Optional[List[int]]] = [
+        None for _ in sampling_metadata.seq_groups
+    ]
+    has_stoken = False
+    has_control = False
+
+    for seq_group_idx, seq_group in enumerate(sampling_metadata.seq_groups):
+        if not seq_group.do_sample or not seq_group.sample_indices:
+            continue
+
+        payload = seq_group.sampling_params.multihead_sampling
+        if not isinstance(payload, dict):
+            continue
+
+        stoken_cfg = _normalize_branch_sampling_config(payload.get("stoken"),
+                                                       logits.shape[-1])
+        control_cfg = _normalize_branch_sampling_config(payload.get("control"),
+                                                        logits.shape[-1])
+        if stoken_cfg is None and control_cfg is None:
+            continue
+
+        if sample_results is None:
+            parent_ids = [0]
+        else:
+            _, parent_ids = sample_results[seq_group_idx]
+            if not parent_ids:
+                continue
+
+        base_idx = seq_group.sample_indices[0]
+        row_indices: List[int] = []
+        for parent_id in parent_ids:
+            row_idx = base_idx + int(parent_id)
+            if row_idx < 0 or row_idx >= logits.shape[0]:
+                continue
+            row_indices.append(row_idx)
+        if not row_indices:
+            continue
+
+        if stoken_cfg is not None:
+            branch_generator = _clone_generator(seq_group.generator,
+                                                logits.device)
+            stoken_token_ids[seq_group_idx] = [
+                _sample_side_branch_token(logits[row_idx], stoken_cfg,
+                                          branch_generator)
+                for row_idx in row_indices
+            ]
+            has_stoken = True
+
+        if control_cfg is not None:
+            branch_generator = _clone_generator(seq_group.generator,
+                                                logits.device)
+            if branch_generator is not None:
+                # De-correlate control draws from stoken draws while keeping
+                # deterministic behavior under a fixed request seed.
+                torch.empty((1,), device=logits.device).uniform_(
+                    generator=branch_generator)
+            control_token_ids[seq_group_idx] = [
+                _sample_side_branch_token(logits[row_idx], control_cfg,
+                                          branch_generator)
+                for row_idx in row_indices
+            ]
+            has_control = True
+
+    return (
+        stoken_token_ids if has_stoken else None,
+        control_token_ids if has_control else None,
+    )
+
+
 def _build_sampler_output(
     maybe_deferred_sample_results: MaybeDeferredSampleResultType,
     sampling_metadata: SamplingMetadata,
     prompt_logprobs: Optional[List[Optional[PromptLogprobs]]],
     sample_logprobs: Optional[List[SampleLogprobs]],
+    stoken_token_ids: Optional[List[Optional[List[int]]]],
+    control_token_ids: Optional[List[Optional[List[int]]]],
     on_device_tensors: Optional[Tuple[torch.Tensor, torch.Tensor,
                                       torch.Tensor]],
     skip_sampler_cpu_output: bool = False,
@@ -1268,6 +1474,7 @@ def _build_sampler_output(
              group_sample_logprobs) in zip(sampling_metadata.seq_groups,
                                            maybe_deferred_sample_results,
                                            prompt_logprobs, sample_logprobs):
+            seq_group_idx = len(sampler_output)
             seq_ids = seq_group.seq_ids
             next_token_ids, parent_ids = sample_result
             seq_outputs: List[SequenceOutput] = []
@@ -1278,7 +1485,15 @@ def _build_sampler_output(
                                    logprobs))
             sampler_output.append(
                 CompletionSequenceGroupOutput(seq_outputs,
-                                              group_prompt_logprobs))
+                                              group_prompt_logprobs,
+                                              stoken_token_ids[
+                                                  seq_group_idx]
+                                              if stoken_token_ids is not None
+                                              else None,
+                                              control_token_ids[
+                                                  seq_group_idx]
+                                              if control_token_ids is not None
+                                              else None))
 
     # If not specified, store None values in SamplerOutput.
     if on_device_tensors is not None:
@@ -1292,6 +1507,8 @@ def _build_sampler_output(
         outputs=sampler_output,
         sampled_token_probs=sampled_token_probs,
         sampled_token_ids=sampled_token_ids,
+        stoken_token_ids=stoken_token_ids,
+        control_token_ids=control_token_ids,
         logprobs=logprobs_tensor,
         deferred_sample_results_args=deferred_sample_results_args)
 

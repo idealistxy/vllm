@@ -14,6 +14,34 @@ from vllm.utils import Counter
 logger = init_logger(__name__)
 
 
+def _append_multihead_side_tokens(seq_group: SequenceGroup,
+                                  output: CompletionSequenceGroupOutput
+                                  ) -> None:
+    mh_state = seq_group.multihead_request_state
+    if mh_state is None:
+        return
+
+    if output.stoken_token_ids is not None:
+        if mh_state.stoken_input_ids is None:
+            mh_state.stoken_input_ids = []
+        mh_state.stoken_input_ids.extend(int(t) for t in output.stoken_token_ids)
+
+    if output.control_token_ids is not None:
+        if mh_state.control_input_ids is None:
+            mh_state.control_input_ids = []
+        mh_state.control_input_ids.extend(
+            int(t) for t in output.control_token_ids)
+
+    # Keep layer-cache plan synchronized with the latest emitted side tokens.
+    layer_cache_plan = getattr(mh_state, "layer_cache_plan", None)
+    if isinstance(layer_cache_plan, dict):
+        if output.stoken_token_ids:
+            layer_cache_plan["stoken_token"] = int(output.stoken_token_ids[-1])
+        if output.control_token_ids:
+            layer_cache_plan["control_token"] = int(output.control_token_ids[-1])
+        layer_cache_plan["reuse_budget"] = 0
+
+
 def single_step_process_prompt_logprob(
         sg_output_proc: SequenceGroupOutputProcessor, seq_group: SequenceGroup,
         output: CompletionSequenceGroupOutput) -> None:
@@ -112,6 +140,9 @@ class SingleStepOutputProcessor(SequenceGroupOutputProcessor):
     def _process_sequence_group_outputs(self, seq_group: SequenceGroup,
                                         outputs: SequenceGroupOutput,
                                         is_async: bool) -> None:
+        assert isinstance(outputs, CompletionSequenceGroupOutput)
+        _append_multihead_side_tokens(seq_group, outputs)
+
         sampling_params = seq_group.sampling_params
 
         sample = outputs.samples[0]

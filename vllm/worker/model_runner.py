@@ -96,6 +96,7 @@ class ModelInputForGPU(ModelRunnerInputBase):
     virtual_engine: int = 0
     async_callback: Optional[Callable] = None
     seq_group_metadata_list: Optional[List[SequenceGroupMetadata]] = None
+    multihead_layer_cache_plan: Optional[Dict[str, Any]] = None
     scheduler_outputs: Optional[SchedulerOutputs] = None
 
     def as_broadcastable_tensor_dict(self) -> Dict[str, Any]:
@@ -110,6 +111,7 @@ class ModelInputForGPU(ModelRunnerInputBase):
             "virtual_engine": self.virtual_engine,
             "request_ids_to_seq_ids": self.request_ids_to_seq_ids,
             "finished_requests_ids": self.finished_requests_ids,
+            "multihead_layer_cache_plan": self.multihead_layer_cache_plan,
         }
         _add_attn_metadata_broadcastable_dict(tensor_dict, self.attn_metadata)
         return tensor_dict
@@ -1088,6 +1090,19 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
               SamplingMetadataCache() \
                 if self.parallel_config.pipeline_parallel_size == 1 else None
 
+    @staticmethod
+    def _extract_multihead_layer_cache_plan(
+        seq_group_metadata_list: Optional[List[SequenceGroupMetadata]],
+    ) -> Optional[Dict[str, Any]]:
+        if not seq_group_metadata_list:
+            return None
+        for seq_group_metadata in seq_group_metadata_list:
+            plan = getattr(seq_group_metadata, "multihead_layer_cache_plan",
+                           None)
+            if isinstance(plan, dict) and plan:
+                return dict(plan)
+        return None
+
     def load_model(self) -> None:
         logger.info("Starting to load model %s...", self.model_config.model)
         with DeviceMemoryProfiler() as m:
@@ -1601,10 +1616,16 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
             sampling_metadata = None
         is_prompt = (seq_group_metadata_list[0].is_prompt
                      if seq_group_metadata_list else None)
+        mh_layer_cache_plan = self._extract_multihead_layer_cache_plan(
+            seq_group_metadata_list)
         return dataclasses.replace(model_input,
                                    sampling_metadata=sampling_metadata,
                                    is_prompt=is_prompt,
-                                   virtual_engine=virtual_engine)
+                                   virtual_engine=virtual_engine,
+                                   seq_group_metadata_list=(
+                                       seq_group_metadata_list),
+                                   multihead_layer_cache_plan=(
+                                       mh_layer_cache_plan))
 
     @torch.inference_mode()
     @dump_input_when_exception(exclude_args=[0], exclude_kwargs=["self"])
@@ -1678,6 +1699,16 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
             model_forward_start.record()
 
         if not bypass_model_exec:
+            step_audio_extra_kwargs: Dict[str, Any] = {}
+            if getattr(model_executable,
+                       "supports_multihead_layer_cache_plan", False):
+                mh_layer_cache_plan = model_input.multihead_layer_cache_plan
+                if mh_layer_cache_plan is None:
+                    mh_layer_cache_plan = self._extract_multihead_layer_cache_plan(
+                        model_input.seq_group_metadata_list)
+                if mh_layer_cache_plan:
+                    step_audio_extra_kwargs[
+                        "multihead_layer_cache_plan"] = mh_layer_cache_plan
             with set_forward_context(model_input.attn_metadata,
                                      self.vllm_config):
                 hidden_or_intermediate_states = model_executable(
@@ -1688,7 +1719,8 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
                     intermediate_tensors=intermediate_tensors,
                     **MultiModalKwargs.as_kwargs(multi_modal_kwargs,
                                                  device=self.device),
-                    **seqlen_agnostic_kwargs)
+                    **seqlen_agnostic_kwargs,
+                    **step_audio_extra_kwargs)
 
         if (self.observability_config is not None
                 and self.observability_config.collect_model_forward_time):

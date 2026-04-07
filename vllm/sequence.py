@@ -122,6 +122,33 @@ class RequestMetrics:
     model_execute_time: Optional[float] = None
 
 
+@dataclass
+class MultiHeadRequestState:
+    """Request-local state for native multi-head generation.
+
+    This structure is intentionally lightweight and optional. It allows
+    upstream components to pass text/stoken/control side-channel state through
+    the engine without relying on process-global bridges.
+    """
+
+    text_input_ids: Optional[List[int]] = None
+    stoken_input_ids: Optional[List[int]] = None
+    control_input_ids: Optional[List[int]] = None
+    audio_features_ref: Optional[str] = None
+
+    keep_alive: bool = False
+    session_id: Optional[str] = None
+    round_id: Optional[int] = None
+
+    text_sampling: Dict[str, Any] = field(default_factory=dict)
+    stoken_sampling: Dict[str, Any] = field(default_factory=dict)
+    control_sampling: Dict[str, Any] = field(default_factory=dict)
+    layer_cache_plan: Dict[str, Any] = field(default_factory=dict)
+
+    def clone(self) -> "MultiHeadRequestState":
+        return copy.deepcopy(self)
+
+
 class SequenceDataDelta(
         msgspec.Struct,
         array_like=True,  # type: ignore[call-arg]
@@ -653,6 +680,7 @@ class SequenceGroup:
         trace_headers: Optional[Mapping[str, str]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         priority: int = 0,
+        multihead_request_state: Optional[MultiHeadRequestState] = None,
     ) -> None:
         self.request_id = request_id
         self.seqs = seqs
@@ -676,6 +704,7 @@ class SequenceGroup:
         self.encoder_seq = encoder_seq
         self.trace_headers = trace_headers
         self.priority = priority
+        self.multihead_request_state = multihead_request_state
 
         self.cached_request_output = None
 
@@ -736,6 +765,10 @@ class SequenceGroup:
     def init_multi_step(self, num_steps: int) -> None:
         self.state.num_steps = num_steps
         self.state.current_step = 0
+
+    @property
+    def has_multihead_request_state(self) -> bool:
+        return self.multihead_request_state is not None
 
     def init_multi_step_from_lookahead_slots(self, num_lookahead_slots: int,
                                              num_scheduler_steps: int,
@@ -875,6 +908,7 @@ class SequenceGroupMetadataDelta(
     do_sample: bool = True
     token_chunk_size: Optional[int] = None
     computed_block_nums: Optional[List[int]] = None
+    multihead_layer_cache_plan: Optional[Dict[str, Any]] = None
     state: Optional[SequenceGroupState] = msgspec.field(
         default_factory=lambda: SequenceGroupState())
 
@@ -937,6 +971,8 @@ class SequenceGroupMetadata(
     cross_block_table: Optional[List[int]] = None
     prompt_adapter_request: Optional[PromptAdapterRequest] = None
     token_chunk_size: Optional[int] = None
+    # Optional request-scoped plan for multi-head layer cache behavior.
+    multihead_layer_cache_plan: Optional[Dict[str, Any]] = None
 
     ### Stateful fields that are lazily defined. ###
     # The number of speculative tokens adopted in this request.
@@ -990,6 +1026,10 @@ class SequenceGroupMetadata(
         self.token_chunk_size = sequence_group_metadata_delta.token_chunk_size
         self.do_sample = sequence_group_metadata_delta.do_sample
         self.is_prompt = sequence_group_metadata_delta.is_prompt
+        if (sequence_group_metadata_delta.multihead_layer_cache_plan
+                is not None):
+            self.multihead_layer_cache_plan = dict(
+                sequence_group_metadata_delta.multihead_layer_cache_plan)
 
     def finish_step(self) -> None:
         assert self.state is not None
@@ -1050,16 +1090,23 @@ class CompletionSequenceGroupOutput(
     samples: List[SequenceOutput]
     # Prompt logprob for each prompt query token.
     prompt_logprobs: Optional[PromptLogprobs]
+    # Optional side-branch sampled token ids (native multi-head protocol).
+    stoken_token_ids: Optional[List[int]] = None
+    control_token_ids: Optional[List[int]] = None
 
     def __repr__(self) -> str:
         return (f"CompletionSequenceGroupOutput(samples={self.samples}, "
-                f"prompt_logprobs={self.prompt_logprobs})")
+                f"prompt_logprobs={self.prompt_logprobs}, "
+                f"stoken_token_ids={self.stoken_token_ids}, "
+                f"control_token_ids={self.control_token_ids})")
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, CompletionSequenceGroupOutput):
             raise NotImplementedError()
         return (self.samples == other.samples
-                and self.prompt_logprobs == other.prompt_logprobs)
+                and self.prompt_logprobs == other.prompt_logprobs
+                and self.stoken_token_ids == other.stoken_token_ids
+                and self.control_token_ids == other.control_token_ids)
 
 
 class PoolingSequenceGroupOutput(
@@ -1372,13 +1419,23 @@ class ParallelSampleSequenceGroup(SequenceGroupBase):
         params.n = 1
         group = ParallelSampleSequenceGroup(request_id)
         seqs = []
+        base_multihead_state = kwargs.get("multihead_request_state")
         for i in range(original_params.n):
             request_id_i = f"{request_id}_parallel_sample_{i}"
             group.seq_id_to_index[request_id_i] = i
+            request_kwargs = kwargs
+            if base_multihead_state is not None:
+                request_kwargs = dict(kwargs)
+                if hasattr(base_multihead_state, "clone"):
+                    request_kwargs["multihead_request_state"] = \
+                        base_multihead_state.clone()
+                else:
+                    request_kwargs["multihead_request_state"] = \
+                        copy.deepcopy(base_multihead_state)
             seq_group = engine._add_processed_request(
                 request_id_i,
                 params=params,
-                **kwargs,
+                **request_kwargs,
             )  # type: ignore
             assert seq_group is not None
             engine.seq_id_to_seq_group[request_id_i] = group
@@ -1400,6 +1457,8 @@ class ParallelSampleSequenceGroup(SequenceGroupBase):
             trace_headers=seq_group.trace_headers,
             prompt_adapter_request=seq_group.prompt_adapter_request,
             priority=seq_group.priority,
+            multihead_request_state=copy.deepcopy(
+                seq_group.multihead_request_state),
         )
 
         group.streaming = params.output_kind == RequestOutputKind.DELTA

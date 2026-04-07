@@ -9,11 +9,13 @@ from vllm.inputs import PromptType, TextPrompt, TokensPrompt
 from vllm.model_executor.models import ModelRegistry
 from vllm.outputs import (ClassificationOutput, ClassificationRequestOutput,
                           CompletionOutput, EmbeddingOutput,
+                          MultiHeadRequestOutput,
                           EmbeddingRequestOutput, PoolingOutput,
                           PoolingRequestOutput, RequestOutput, ScoringOutput,
                           ScoringRequestOutput)
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
+from vllm.sequence import MultiHeadRequestState
 
 from .version import __version__, __version_tuple__
 
@@ -26,7 +28,9 @@ __all__ = [
     "TextPrompt",
     "TokensPrompt",
     "SamplingParams",
+    "MultiHeadRequestState",
     "RequestOutput",
+    "MultiHeadRequestOutput",
     "CompletionOutput",
     "PoolingOutput",
     "PoolingRequestOutput",

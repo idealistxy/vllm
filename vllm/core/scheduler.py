@@ -1359,6 +1359,14 @@ class Scheduler:
                         seqs[0].data.get_len()):
                     do_sample = False
 
+            mh_layer_cache_plan = None
+            mh_state = getattr(seq_group, "multihead_request_state", None)
+            if mh_state is not None:
+                raw_plan = getattr(mh_state, "layer_cache_plan", None)
+                if isinstance(raw_plan, dict) and raw_plan:
+                    # Keep this payload primitive-only for msgspec transport.
+                    mh_layer_cache_plan = dict(raw_plan)
+
             # It assumes the scheduled_seq_groups is ordered by
             # prefill < decoding.
             if is_first_prefill or not self.scheduler_config.send_delta_data:
@@ -1387,6 +1395,7 @@ class Scheduler:
                     if scheduler_outputs.num_prefill_groups > 0 else None,
                     mm_processor_kwargs=seq_group.mm_processor_kwargs,
                     prompt_adapter_request=seq_group.prompt_adapter_request,
+                    multihead_layer_cache_plan=mh_layer_cache_plan,
                 )
             else:
                 # When SPMD mode is enabled, we only send delta data except for
@@ -1402,6 +1411,7 @@ class Scheduler:
                     do_sample=do_sample,
                     token_chunk_size=token_chunk_size,
                     computed_block_nums=common_computed_block_nums,
+                    multihead_layer_cache_plan=mh_layer_cache_plan,
                 )
             seq_group_metadata_list.append(seq_group_metadata)
 

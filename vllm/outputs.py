@@ -1,6 +1,6 @@
 import time
 from dataclasses import dataclass
-from typing import Dict, Generic, List, Optional
+from typing import Any, Dict, Generic, List, Optional
 from typing import Sequence as GenericSequence
 from typing import Union
 
@@ -312,6 +312,23 @@ class RequestOutput:
         else:
             request_output = cls(**init_kwargs)  # type: ignore
 
+        if getattr(seq_group, "has_multihead_request_state", False):
+            mh_state = getattr(seq_group, "multihead_request_state", None)
+            if mh_state is not None:
+                state_payload: Dict[str, Any] = {
+                    "keep_alive": bool(getattr(mh_state, "keep_alive", False)),
+                    "session_id": getattr(mh_state, "session_id", None),
+                    "round_id": getattr(mh_state, "round_id", None),
+                }
+                request_output = MultiHeadRequestOutput.from_request_output(
+                    request_output,
+                    stoken_token_ids=_copy_optional_int_list(
+                        getattr(mh_state, "stoken_input_ids", None)),
+                    control_token_ids=_copy_optional_int_list(
+                        getattr(mh_state, "control_input_ids", None)),
+                    multihead_state=state_payload,
+                )
+
         return request_output
 
     def __repr__(self) -> str:
@@ -327,6 +344,94 @@ class RequestOutput:
                 f"lora_request={self.lora_request}, "
                 f"num_cached_tokens={self.num_cached_tokens}, "
                 f"multi_modal_placeholders={self.multi_modal_placeholders})")
+
+
+def _copy_optional_int_list(value: Optional[GenericSequence[int]]
+                            ) -> Optional[List[int]]:
+    if value is None:
+        return None
+    return [int(x) for x in value]
+
+
+class MultiHeadRequestOutput(RequestOutput):
+    """RequestOutput extension for native multi-head generation protocol.
+
+    This class is protocol-focused in P2-02 and intentionally lightweight:
+    it augments RequestOutput with side-channel token tracks and an optional
+    state snapshot while remaining compatible with existing RequestOutput
+    consumers.
+    """
+
+    def __init__(
+        self,
+        request_id: str,
+        prompt: Optional[str],
+        prompt_token_ids: Optional[List[int]],
+        prompt_logprobs: Optional[PromptLogprobs],
+        outputs: List[CompletionOutput],
+        finished: bool,
+        metrics: Optional[RequestMetrics] = None,
+        lora_request: Optional[LoRARequest] = None,
+        encoder_prompt: Optional[str] = None,
+        encoder_prompt_token_ids: Optional[List[int]] = None,
+        num_cached_tokens: Optional[int] = None,
+        *,
+        multi_modal_placeholders: Optional[MultiModalPlaceholderDict] = None,
+        stoken_token_ids: Optional[List[int]] = None,
+        control_token_ids: Optional[List[int]] = None,
+        multihead_state: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        super().__init__(
+            request_id=request_id,
+            prompt=prompt,
+            prompt_token_ids=prompt_token_ids,
+            prompt_logprobs=prompt_logprobs,
+            outputs=outputs,
+            finished=finished,
+            metrics=metrics,
+            lora_request=lora_request,
+            encoder_prompt=encoder_prompt,
+            encoder_prompt_token_ids=encoder_prompt_token_ids,
+            num_cached_tokens=num_cached_tokens,
+            multi_modal_placeholders=multi_modal_placeholders,
+        )
+        self.stoken_token_ids = stoken_token_ids
+        self.control_token_ids = control_token_ids
+        self.multihead_state = multihead_state
+
+    @classmethod
+    def from_request_output(
+        cls,
+        request_output: RequestOutput,
+        stoken_token_ids: Optional[List[int]] = None,
+        control_token_ids: Optional[List[int]] = None,
+        multihead_state: Optional[Dict[str, Any]] = None,
+    ) -> "MultiHeadRequestOutput":
+        return cls(
+            request_id=request_output.request_id,
+            prompt=request_output.prompt,
+            prompt_token_ids=request_output.prompt_token_ids,
+            prompt_logprobs=request_output.prompt_logprobs,
+            outputs=request_output.outputs,
+            finished=request_output.finished,
+            metrics=request_output.metrics,
+            lora_request=request_output.lora_request,
+            encoder_prompt=request_output.encoder_prompt,
+            encoder_prompt_token_ids=request_output.encoder_prompt_token_ids,
+            num_cached_tokens=request_output.num_cached_tokens,
+            multi_modal_placeholders=request_output.multi_modal_placeholders,
+            stoken_token_ids=stoken_token_ids,
+            control_token_ids=control_token_ids,
+            multihead_state=multihead_state,
+        )
+
+    def __repr__(self) -> str:
+        return (f"MultiHeadRequestOutput(request_id={self.request_id}, "
+                f"finished={self.finished}, "
+                f"outputs={self.outputs}, "
+                f"stoken_token_ids={self.stoken_token_ids}, "
+                f"control_token_ids={self.control_token_ids}, "
+                f"multihead_state={self.multihead_state})")
 
 
 _O = TypeVar("_O", default=PoolingOutput)
